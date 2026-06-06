@@ -33,13 +33,11 @@ void poseidon_load_constants_v2(const uint64_t* h_rc, size_t rc_count,
 }
 
 // =============================================================================
-// Unified leaf kernel — one block per leaf, T threads per block.
+// Unified leaf kernel — one block per leaf.
 //
-// K12 branch:    only thread 0 calls k12_device_hash; threads 1-2 idle.
-// Poseidon branch: all T threads cooperate via poseidon_hash_device.
-//
-// Launching with T threads for every hash type lets a single kernel serve
-// both. The two idle threads for K12 are the only cost.
+// K12:      launch with K12_DEVICE_BLOCK_THREADS (128); every thread calls
+//           k12_device_hash() so multi-chunk leaves (>8192 B) parallelize.
+// Poseidon: launch with T threads; all cooperate via poseidon_hash_device.
 // =============================================================================
 __global__ void leafKernel_unified(const uint8_t* d_leafData,
                                     const size_t*  d_leafOffsets,
@@ -59,12 +57,9 @@ __global__ void leafKernel_unified(const uint8_t* d_leafData,
     uint8_t*       out = d_nodes + leafLayerOffset + i * HASH_SIZE_V2;
 
     if (hashType == HashType::K12) {
-        // Sequential device function — thread 0 only
-        if (threadIdx.x == 0) {
-            uint8_t* scratch = (scratch_per_leaf > 0)
-                               ? d_scratch + i * scratch_per_leaf : nullptr;
-            k12_device_hash(in, static_cast<size_t>(len), out, HASH_SIZE_V2, scratch);
-        }
+        uint8_t* scratch = (scratch_per_leaf > 0)
+                           ? d_scratch + i * scratch_per_leaf : nullptr;
+        k12_device_hash(in, static_cast<size_t>(len), out, HASH_SIZE_V2, scratch);
     } else {
         // All T threads cooperate; poseidon_hash_device handles sync internally
         poseidon_hash_device(in, len, out, V2_POSEIDON_RC, V2_POSEIDON_MDS);
@@ -106,8 +101,7 @@ __global__ void internalNodeKernel_unified(uint8_t* d_nodes,
     uint8_t* parent = d_nodes + currOffset + i * HASH_SIZE_V2;
 
     if (hashType == HashType::K12) {
-        if (threadIdx.x == 0)
-            k12_device_hash(combined, HASH_SIZE_V2 * 2, parent, HASH_SIZE_V2, nullptr);
+        k12_device_hash(combined, HASH_SIZE_V2 * 2, parent, HASH_SIZE_V2, nullptr);
     } else {
         poseidon_hash_device(combined, (int)(HASH_SIZE_V2 * 2), parent,
                              V2_POSEIDON_RC, V2_POSEIDON_MDS);
@@ -183,10 +177,12 @@ MerkleTreeGPU_v2 buildMerkleTree_GPU_v2(
     if (hashType == HashType::K12 && scratch_per_leaf > 0)
         cudaMalloc(&d_scratch, n * scratch_per_leaf);
 
-    // Launch leaf kernel — one block per leaf, T threads per block
-    leafKernel_unified<<<n, T>>>(d_leafData, d_leafOffsets, d_leafLengths,
-                                  d_nodes, offsets[0], n,
-                                  hashType, d_scratch, scratch_per_leaf);
+    // Launch leaf kernel — one block per leaf
+    const unsigned leaf_threads = (hashType == HashType::K12)
+        ? K12_DEVICE_BLOCK_THREADS : static_cast<unsigned>(T);
+    leafKernel_unified<<<n, leaf_threads>>>(d_leafData, d_leafOffsets, d_leafLengths,
+                                             d_nodes, offsets[0], n,
+                                             hashType, d_scratch, scratch_per_leaf);
     cudaDeviceSynchronize();
 
     if (d_scratch) cudaFree(d_scratch);
@@ -208,7 +204,9 @@ MerkleTreeGPU_v2 buildMerkleTree_GPU_v2(
         }
 
         size_t numParents = paddedSize / 2;
-        internalNodeKernel_unified<<<numParents, T>>>(
+        const unsigned internal_threads = (hashType == HashType::K12)
+            ? K12_DEVICE_BLOCK_THREADS : static_cast<unsigned>(T);
+        internalNodeKernel_unified<<<numParents, internal_threads>>>(
             d_nodes, offsets[layer - 1], offsets[layer], numParents, hashType);
         cudaDeviceSynchronize();
     }
