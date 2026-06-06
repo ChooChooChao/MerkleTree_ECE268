@@ -42,6 +42,11 @@
 #endif
 
 // ---------------------------------------------------------------------------
+// Leaf sizes
+// ---------------------------------------------------------------------------
+static constexpr size_t LEAF_SIZE_1MB = 1048576u;
+
+// ---------------------------------------------------------------------------
 // Tracking
 // ---------------------------------------------------------------------------
 static int g_tests_run    = 0;
@@ -376,6 +381,33 @@ static void test_k12()
         CHECK(result, "K12 odd leaves: last leaf validates");
         freeMerkleTree_GPU_v2(gpuRaw);
     }
+
+    // ------------------------------------------------------------------
+    // Large leaves (1 MB): GPU must use K12 multi-chunk path (128 threads)
+    // ------------------------------------------------------------------
+    {
+        std::cout << "  Building 4 x 1 MB leaves (may take a moment)...\n";
+        std::vector<std::vector<uint8_t>> data(4);
+        for (size_t i = 0; i < data.size(); i++) {
+            data[i].resize(LEAF_SIZE_1MB);
+            for (size_t j = 0; j < LEAF_SIZE_1MB; j++)
+                data[i][j] = static_cast<uint8_t>((i + j) % 251);
+        }
+
+        MerkleTree     cpuTree  = buildMerkleTree(data, k12HashCPU);
+        MerkleTreeGPU_v2 gpuRaw = buildMerkleTree_GPU_v2(data, HashType::K12);
+        MerkleTree     gpuTree  = copyTreeToHost_v2(gpuRaw);
+
+        CHECK(cpuTree.nodes == gpuTree.nodes,
+              "K12 correctness: 4 x 1 MB leaves, all nodes match CPU");
+        if (cpuTree.nodes != gpuTree.nodes) {
+            auto cpuRoot = getNode(cpuTree, cpuTree.numLayers - 1, 0);
+            auto gpuRoot = getNode(gpuTree, gpuTree.numLayers - 1, 0);
+            print_hash("CPU root", cpuRoot);
+            print_hash("GPU root", gpuRoot);
+        }
+        freeMerkleTree_GPU_v2(gpuRaw);
+    }
 }
 
 // ===========================================================================
@@ -558,6 +590,20 @@ static void test_poseidon()
 using hrc = std::chrono::high_resolution_clock;
 using ms  = std::chrono::duration<double, std::milli>;
 
+// Generate num_leaves binary blobs each exactly leaf_bytes long.
+// Uses a deterministic byte pattern (not ASCII) so large leaves are cheap to build.
+static std::vector<std::vector<uint8_t>>
+make_pattern_leaves(int num_leaves, size_t leaf_bytes)
+{
+    std::vector<std::vector<uint8_t>> data(num_leaves);
+    for (int i = 0; i < num_leaves; i++) {
+        data[i].resize(leaf_bytes);
+        for (size_t j = 0; j < leaf_bytes; j++)
+            data[i][j] = static_cast<uint8_t>((i + j) % 251);
+    }
+    return data;
+}
+
 // Generate num_leaves ASCII strings each exactly leaf_bytes long.
 static std::vector<std::string>
 make_text_inputs(int num_leaves, int leaf_bytes)
@@ -678,8 +724,9 @@ static std::string fmt_spdup(double cpu, double gpu)
 static void benchmark()
 {
     std::cout << "\n=== Benchmark: CPU vs GPU Merkle Tree Build Time ===\n";
-    std::cout << "  K12     — CPU: single-threaded C++ | GPU: CUDA (1 warmup + 5 runs).\n";
+    std::cout << "  K12      — CPU: single-threaded C++ | GPU: CUDA (1 warmup + 5 runs).\n";
     std::cout << "  Poseidon — CPU: Python self-reported time | GPU: CUDA (1 warmup + 5 runs).\n";
+    std::cout << "  1 MB leaf configs use binary pattern data; Poseidon CPU is skipped.\n";
     std::cout << "  GPU times include host<->device memcpy.\n";
     std::cout << "  Speedup = CPU / GPU  (>1x means GPU is faster).\n\n";
 
@@ -695,12 +742,11 @@ static void benchmark()
     std::cout << std::string(59, '-') << "\n";
 
     const int configs[][2] = {
-        {  64,  256 },
-        { 256,  256 },
-        {  64, 1024 },
-        { 256, 1024 },
-        {1024,  256 },
-        {1024, 1024 },
+        {  64,       256 },
+        {  64,      1024 },
+        {  16,  1048576 },   // 1 MB leaves — K12 multi-chunk path
+        {  64,  1048576 },
+        { 256,  1048576 },
     };
 
     auto mean = [](const std::vector<double>& v) {
@@ -722,8 +768,18 @@ static void benchmark()
 
     for (auto& cfg : configs) {
         int num_leaves = cfg[0], leaf_bytes = cfg[1];
-        auto inputs = make_text_inputs(num_leaves, leaf_bytes);
-        auto data   = text_to_bytes(inputs);
+        const bool large_leaves = leaf_bytes >= static_cast<int>(LEAF_SIZE_1MB);
+
+        std::vector<std::vector<uint8_t>> data;
+        std::vector<std::string> text_inputs;
+        if (large_leaves) {
+            std::cout << "  [" << num_leaves << "x" << leaf_bytes
+                      << "B — allocating pattern leaves...]\n";
+            data = make_pattern_leaves(num_leaves, static_cast<size_t>(leaf_bytes));
+        } else {
+            text_inputs = make_text_inputs(num_leaves, leaf_bytes);
+            data = text_to_bytes(text_inputs);
+        }
 
         // --- K12 ---
         std::vector<double> ck12_s, gk12_s;
@@ -743,6 +799,13 @@ static void benchmark()
             }
         }
 
+        print_row("K12", num_leaves, leaf_bytes, mean(ck12_s), mean(gk12_s));
+
+        if (large_leaves) {
+            std::cout << "  (Poseidon CPU/GPU skipped for 1 MB leaves)\n\n";
+            continue;
+        }
+
         // --- GPU Poseidon ---
         std::vector<double> gpos_s;
         for (int r = 0; r < 6; r++) {
@@ -755,10 +818,9 @@ static void benchmark()
 
         // --- CPU Poseidon (Python, one run) ---
         std::cout << "  [" << num_leaves << "x" << leaf_bytes << "B — invoking Python...]\n";
-        double cpos = run_python_poseidon_timed(inputs);
+        double cpos = run_python_poseidon_timed(text_inputs);
 
-        print_row("K12",      num_leaves, leaf_bytes, mean(ck12_s), mean(gk12_s));
-        print_row("Poseidon", num_leaves, leaf_bytes, cpos,         mean(gpos_s));
+        print_row("Poseidon", num_leaves, leaf_bytes, cpos, mean(gpos_s));
         std::cout << "\n";
     }
 }
