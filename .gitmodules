@@ -1,3 +1,6 @@
 [submodule "ECE268_Spring2026_Poseidon"]
 	path = ECE268_Spring2026_Poseidon
 	url = https://github.com/ptempk/ECE268_Spring2026_Poseidon.git
+[submodule "KangarooTwelve_ECE268"]
+	path = KangarooTwelve_ECE268
+	url = https://github.com/AryanBaokar/KangarooTwelve_ECE268
