@@ -14,7 +14,8 @@
 #include "MerkleTree_GPU_v2.cuh"
 #include "../CPU/MerkleTree.h"
 #include "../../KangarooTwelve_ECE268/CPU/k12.h"
-
+#include <array>
+#include <numeric>
 #include <iostream>
 #include <fstream>
 #include <sstream>
