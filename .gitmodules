@@ -1,0 +1,3 @@
+[submodule "ECE268_Spring2026_Poseidon"]
+	path = ECE268_Spring2026_Poseidon
+	url = https://github.com/ptempk/ECE268_Spring2026_Poseidon.git
